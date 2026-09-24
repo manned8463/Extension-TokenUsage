@@ -2334,14 +2334,15 @@ function patchConnectionManager() {
 
                     // TEMP DEBUG - remove once the result shape is confirmed.
                     try {
-                        console.log('[Token Usage Tracker][DEBUG] sendRequest result shape', {
-                            type: typeof result,
-                            isArray: Array.isArray(result),
-                            keys: result && typeof result === 'object' ? Object.keys(result) : null,
-                            preview: JSON.stringify(result)?.slice(0, 500),
-                        });
+                        const keys = result && typeof result === 'object' ? Object.keys(result) : null;
+                        console.log('[Token Usage Tracker][DEBUG] sendRequest result keys:', keys);
+                        if (keys) {
+                            for (const key of keys) {
+                                console.log(`[Token Usage Tracker][DEBUG] result.${key} =`, result[key]);
+                            }
+                        }
                     } catch (e) {
-                        console.log('[Token Usage Tracker][DEBUG] sendRequest result (unstringifiable):', result);
+                        console.log('[Token Usage Tracker][DEBUG] sendRequest result (error inspecting):', result, e);
                     }
 
                     try {
