@@ -2103,6 +2103,10 @@ function createSettingsUI() {
  * - ConnectionManagerRequestService.sendRequest (Used by extensions like Roadway)
  */
 let isTrackingBackground = false;
+/** Timestamp of the last time patchFetchForExtensionCalls recorded usage, used
+ *  by patchConnectionManager to know whether it needs to fall back to its own
+ *  (less accurate) manual counting. */
+let lastExtensionFetchRecordAt = 0;
 
 function patchBackgroundGenerations() {
     patchGenerateQuietPrompt();
@@ -2144,10 +2148,13 @@ function patchFetchForExtensionCalls() {
         const url = typeof input === 'string' ? input : (input?.url || '');
         const isGenerationCall = GENERATION_ENDPOINTS.some(ep => url.includes(ep));
 
-        // Skip anything not aimed at a generation endpoint, and skip whenever
-        // a call we already track (main chat flow, or ConnectionManager) is
-        // in flight, so we never double-count the same exchange.
-        if (!isGenerationCall || isTrackingBackground || pendingInputTokensPromise) {
+        // Skip anything not aimed at a generation endpoint, or whenever the
+        // main chat flow (Generate()) is currently in flight, so we never
+        // double-count that exchange. ConnectionManagerRequestService calls
+        // (isTrackingBackground) are intentionally NOT skipped here - this is
+        // the most accurate place to record them, since the raw response
+        // carries the API's own usage numbers, not an estimate.
+        if (!isGenerationCall || pendingInputTokensPromise) {
             return originalFetch(input, init);
         }
 
@@ -2171,7 +2178,6 @@ function patchFetchForExtensionCalls() {
 
         try {
             isTrackingBackground = true;
-            const modelId = requestBody?.model || getGeneratingModel();
 
             let inputTokens = 0;
             if (requestBody) {
@@ -2183,10 +2189,12 @@ function patchFetchForExtensionCalls() {
             const contentType = cloned.headers.get('content-type') || '';
             let outputTokens = 0;
             let apiUsage = null;
+            let responseModel = null;
 
             if (contentType.includes('application/json')) {
                 const json = await cloned.json().catch(() => null);
                 if (json) {
+                    responseModel = json.model || null;
                     apiUsage = parseApiUsage(json.usage);
                     const outputText = json.choices?.[0]?.message?.content
                         ?? json.choices?.[0]?.text
@@ -2200,12 +2208,19 @@ function patchFetchForExtensionCalls() {
                 }
             }
 
+            // The API's own echoed model (from the response) is the ground truth -
+            // it reflects whichever connection profile/model an extension actually
+            // used, which can differ from ST's main-UI active connection.
+            const modelId = responseModel || requestBody?.model || getGeneratingModel();
+
             if (apiUsage) {
                 recordUsage(apiUsage.input, apiUsage.output, null, modelId, apiUsage);
                 console.log(`[Token Usage Tracker] Recorded extension fetch() call (API-reported): ${apiUsage.input} in, ${apiUsage.output} out, model: ${modelId || 'unknown'}`);
+                lastExtensionFetchRecordAt = Date.now();
             } else if (inputTokens > 0 || outputTokens > 0) {
                 recordUsage(inputTokens, outputTokens, null, modelId);
                 console.log(`[Token Usage Tracker] Recorded extension fetch() call: ${inputTokens} in, ${outputTokens} out, model: ${modelId || 'unknown'}`);
+                lastExtensionFetchRecordAt = Date.now();
             }
         } catch (e) {
             console.error('[Token Usage Tracker] Error tracking extension fetch() call:', e);
@@ -2292,6 +2307,34 @@ function resolveProfileModel(profileId) {
     }
 }
 
+/**
+ * Best-effort text extraction from a ConnectionManagerRequestService.sendRequest()
+ * result, for the fallback counting path. Handles both a plain string and the
+ * structured-output shape (e.g. { content: {...parsedJson}, reasoning: '...' })
+ * some extensions request.
+ * @param {*} result
+ * @returns {string}
+ */
+function extractTextFromSendRequestResult(result) {
+    if (!result) return '';
+    if (typeof result === 'string') return result;
+
+    const parts = [];
+    if (typeof result.content === 'string') {
+        parts.push(result.content);
+    } else if (result.content && typeof result.content === 'object') {
+        try {
+            parts.push(JSON.stringify(result.content));
+        } catch (e) {
+            // Circular or otherwise unstringifiable - skip it
+        }
+    }
+    if (typeof result.reasoning === 'string') {
+        parts.push(result.reasoning);
+    }
+    return parts.join('\n');
+}
+
 function patchConnectionManager() {
     // Poll for ConnectionManagerRequestService (used by Roadway and similar extensions)
     const checkInterval = setInterval(() => {
@@ -2312,52 +2355,41 @@ function patchConnectionManager() {
                     return await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
                 }
 
-                let inputTokens = 0;
                 // Prefer the model actually configured on this profile/override, since
                 // getGeneratingModel() only reflects the main UI's active connection,
                 // which can differ from the profile the extension explicitly requested.
+                // (Used only as a fallback below - the fetch-level patch normally
+                // resolves this itself from the API's own response.)
                 const modelId = overridePayload?.model
                     || custom?.model
                     || resolveProfileModel(profileId)
                     || getGeneratingModel();
 
+                const beforeRecordTs = lastExtensionFetchRecordAt;
+
                 try {
                     isTrackingBackground = true;
-
-                    try {
-                        inputTokens = await countInputTokens({ prompt: messages });
-                    } catch (e) {
-                        console.error('[Token Usage Tracker] Error counting sendRequest input:', e);
-                    }
-
                     const result = await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
 
-                    // TEMP DEBUG - remove once the result shape is confirmed.
-                    try {
-                        const keys = result && typeof result === 'object' ? Object.keys(result) : null;
-                        console.log('[Token Usage Tracker][DEBUG] sendRequest result keys:', keys);
-                        if (keys) {
-                            for (const key of keys) {
-                                console.log(`[Token Usage Tracker][DEBUG] result.${key} =`, result[key]);
+                    // patchFetchForExtensionCalls sees the same network call this
+                    // sendRequest() triggers, and reads the API's own usage numbers
+                    // straight off the response - which is more accurate than
+                    // anything we can estimate from sendRequest's return value.
+                    // Only fall back to manual counting here if that didn't happen
+                    // (e.g. a non-JSON response, or an endpoint not in our list).
+                    if (lastExtensionFetchRecordAt === beforeRecordTs) {
+                        try {
+                            const inputTokens = await countInputTokens({ prompt: messages });
+                            const outputText = extractTextFromSendRequestResult(result);
+                            const outputTokens = outputText ? await countTokens(outputText) : 0;
+
+                            if (outputTokens > 0 || inputTokens > 0) {
+                                recordUsage(inputTokens, outputTokens, null, modelId);
+                                console.log(`[Token Usage Tracker] Recorded sendRequest call (fallback estimate): ${inputTokens} in, ${outputTokens} out, model: ${modelId || 'unknown'}`);
                             }
+                        } catch (e) {
+                            console.error('[Token Usage Tracker] Error in sendRequest fallback counting:', e);
                         }
-                    } catch (e) {
-                        console.log('[Token Usage Tracker][DEBUG] sendRequest result (error inspecting):', result, e);
-                    }
-
-                    try {
-                        let outputTokens = 0;
-                        if (result && typeof result.content === 'string') {
-                            outputTokens = await countTokens(result.content);
-                        } else if (typeof result === 'string') {
-                            outputTokens = await countTokens(result);
-                        }
-
-                        if (outputTokens > 0 || inputTokens > 0) {
-                            recordUsage(inputTokens, outputTokens, null, modelId);
-                        }
-                    } catch (e) {
-                        console.error('[Token Usage Tracker] Error counting sendRequest output:', e);
                     }
 
                     return result;
