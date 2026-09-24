@@ -2282,7 +2282,9 @@ function resolveProfileModel(profileId) {
         const profiles = context?.extensionSettings?.connectionManager?.profiles
             || context?.extension_settings?.connectionManager?.profiles
             || [];
-        const profile = profiles.find(p => p.id === profileId);
+        // Match by id first (the documented identifier), but fall back to name
+        // in case the caller passed a profile name instead of its id.
+        const profile = profiles.find(p => p.id === profileId) || profiles.find(p => p.name === profileId);
         return profile?.model || null;
     } catch (e) {
         console.error('[Token Usage Tracker] Error resolving connection profile model:', e);
@@ -2314,10 +2316,20 @@ function patchConnectionManager() {
                 // Prefer the model actually configured on this profile/override, since
                 // getGeneratingModel() only reflects the main UI's active connection,
                 // which can differ from the profile the extension explicitly requested.
+                const resolvedProfileModel = resolveProfileModel(profileId);
                 const modelId = overridePayload?.model
                     || custom?.model
-                    || resolveProfileModel(profileId)
+                    || resolvedProfileModel
                     || getGeneratingModel();
+
+                // TEMP DEBUG - remove once the model resolution is confirmed correct.
+                console.log('[Token Usage Tracker][DEBUG] sendRequest called with', {
+                    profileId,
+                    overridePayloadModel: overridePayload?.model,
+                    customModel: custom?.model,
+                    resolvedProfileModel,
+                    finalModelId: modelId,
+                });
 
                 try {
                     isTrackingBackground = true;
