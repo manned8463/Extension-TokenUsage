@@ -2267,6 +2267,29 @@ async function flushQuietGeneration() {
     }
 }
 
+/**
+ * Look up the model configured on a specific Connection Manager profile,
+ * instead of assuming the currently-active/main connection profile is the
+ * one an extension's sendRequest() call actually used.
+ * @param {string} profileId
+ * @returns {string|null}
+ */
+function resolveProfileModel(profileId) {
+    if (!profileId) return null;
+    try {
+        const context = getContext();
+        // Field path has moved before between ST versions - try the known spots.
+        const profiles = context?.extensionSettings?.connectionManager?.profiles
+            || context?.extension_settings?.connectionManager?.profiles
+            || [];
+        const profile = profiles.find(p => p.id === profileId);
+        return profile?.model || null;
+    } catch (e) {
+        console.error('[Token Usage Tracker] Error resolving connection profile model:', e);
+        return null;
+    }
+}
+
 function patchConnectionManager() {
     // Poll for ConnectionManagerRequestService (used by Roadway and similar extensions)
     const checkInterval = setInterval(() => {
@@ -2288,7 +2311,13 @@ function patchConnectionManager() {
                 }
 
                 let inputTokens = 0;
-                const modelId = getGeneratingModel();
+                // Prefer the model actually configured on this profile/override, since
+                // getGeneratingModel() only reflects the main UI's active connection,
+                // which can differ from the profile the extension explicitly requested.
+                const modelId = overridePayload?.model
+                    || custom?.model
+                    || resolveProfileModel(profileId)
+                    || getGeneratingModel();
 
                 try {
                     isTrackingBackground = true;
