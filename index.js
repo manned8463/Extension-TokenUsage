@@ -2316,20 +2316,10 @@ function patchConnectionManager() {
                 // Prefer the model actually configured on this profile/override, since
                 // getGeneratingModel() only reflects the main UI's active connection,
                 // which can differ from the profile the extension explicitly requested.
-                const resolvedProfileModel = resolveProfileModel(profileId);
                 const modelId = overridePayload?.model
                     || custom?.model
-                    || resolvedProfileModel
+                    || resolveProfileModel(profileId)
                     || getGeneratingModel();
-
-                // TEMP DEBUG - remove once the model resolution is confirmed correct.
-                console.log('[Token Usage Tracker][DEBUG] sendRequest called with', {
-                    profileId,
-                    overridePayloadModel: overridePayload?.model,
-                    customModel: custom?.model,
-                    resolvedProfileModel,
-                    finalModelId: modelId,
-                });
 
                 try {
                     isTrackingBackground = true;
@@ -2341,6 +2331,18 @@ function patchConnectionManager() {
                     }
 
                     const result = await originalSendRequest(profileId, messages, maxTokens, custom, overridePayload);
+
+                    // TEMP DEBUG - remove once the result shape is confirmed.
+                    try {
+                        console.log('[Token Usage Tracker][DEBUG] sendRequest result shape', {
+                            type: typeof result,
+                            isArray: Array.isArray(result),
+                            keys: result && typeof result === 'object' ? Object.keys(result) : null,
+                            preview: JSON.stringify(result)?.slice(0, 500),
+                        });
+                    } catch (e) {
+                        console.log('[Token Usage Tracker][DEBUG] sendRequest result (unstringifiable):', result);
+                    }
 
                     try {
                         let outputTokens = 0;
