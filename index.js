@@ -2107,6 +2107,117 @@ let isTrackingBackground = false;
 function patchBackgroundGenerations() {
     patchGenerateQuietPrompt();
     patchConnectionManager();
+    patchFetchForExtensionCalls();
+}
+
+/**
+ * Endpoints on the SillyTavern server itself that trigger an LLM generation.
+ * Extension code (generateRaw, custom fetch calls, third-party libs, etc.) has
+ * to route through one of these, since extensions don't hold your API keys.
+ * Add more path fragments here if a specific extension uses a different route
+ * (check the Network tab in devtools while it runs to find it).
+ */
+const GENERATION_ENDPOINTS = [
+    '/api/backends/chat-completions/generate',
+    '/api/backends/text-completions/generate',
+    '/api/novelai/generate',
+    '/api/openai/generate',
+];
+
+/**
+ * Patch window.fetch to catch generation requests that bypass both the main
+ * Generate() event flow AND ConnectionManagerRequestService.sendRequest -
+ * e.g. extensions calling generateRaw() (an ES export we can't monkey-patch
+ * directly) or extensions issuing their own fetch() to ST's backend routes.
+ *
+ * Only non-streaming (stream:false / stream:undefined) requests can be
+ * counted this way, since a streamed response body can't be read back out
+ * after the caller consumes it. Most one-off "background" extension calls
+ * (translation, summarization helpers, etc.) use non-streaming requests.
+ */
+function patchFetchForExtensionCalls() {
+    if (window.fetch._tokenUsageTrackerPatched) return;
+
+    const originalFetch = window.fetch.bind(window);
+
+    const patchedFetch = async function(input, init) {
+        const url = typeof input === 'string' ? input : (input?.url || '');
+        const isGenerationCall = GENERATION_ENDPOINTS.some(ep => url.includes(ep));
+
+        // Skip anything not aimed at a generation endpoint, and skip whenever
+        // a call we already track (main chat flow, or ConnectionManager) is
+        // in flight, so we never double-count the same exchange.
+        if (!isGenerationCall || isTrackingBackground || pendingInputTokensPromise) {
+            return originalFetch(input, init);
+        }
+
+        let requestBody = null;
+        try {
+            const rawBody = typeof input !== 'string' && input?.body ? input.body : init?.body;
+            if (typeof rawBody === 'string') {
+                requestBody = JSON.parse(rawBody);
+            }
+        } catch (e) {
+            // Not JSON (or no body) - can't count input, but still let the call through
+        }
+
+        // A streaming request's response body can only be read once, and we
+        // don't reconstruct SSE chunks here, so don't try to intercept those.
+        if (requestBody?.stream) {
+            return originalFetch(input, init);
+        }
+
+        const response = await originalFetch(input, init);
+
+        try {
+            isTrackingBackground = true;
+            const modelId = requestBody?.model || getGeneratingModel();
+
+            let inputTokens = 0;
+            if (requestBody) {
+                inputTokens = await countInputTokens({ prompt: requestBody.messages || requestBody.prompt });
+            }
+
+            // Clone so the extension that made the call still gets an unread body
+            const cloned = response.clone();
+            const contentType = cloned.headers.get('content-type') || '';
+            let outputTokens = 0;
+            let apiUsage = null;
+
+            if (contentType.includes('application/json')) {
+                const json = await cloned.json().catch(() => null);
+                if (json) {
+                    apiUsage = parseApiUsage(json.usage);
+                    const outputText = json.choices?.[0]?.message?.content
+                        ?? json.choices?.[0]?.text
+                        ?? json.results?.[0]?.text
+                        ?? json.content
+                        ?? json.text
+                        ?? '';
+                    if (typeof outputText === 'string' && outputText) {
+                        outputTokens = await countTokens(outputText);
+                    }
+                }
+            }
+
+            if (apiUsage) {
+                recordUsage(apiUsage.input, apiUsage.output, null, modelId, apiUsage);
+                console.log(`[Token Usage Tracker] Recorded extension fetch() call (API-reported): ${apiUsage.input} in, ${apiUsage.output} out, model: ${modelId || 'unknown'}`);
+            } else if (inputTokens > 0 || outputTokens > 0) {
+                recordUsage(inputTokens, outputTokens, null, modelId);
+                console.log(`[Token Usage Tracker] Recorded extension fetch() call: ${inputTokens} in, ${outputTokens} out, model: ${modelId || 'unknown'}`);
+            }
+        } catch (e) {
+            console.error('[Token Usage Tracker] Error tracking extension fetch() call:', e);
+        } finally {
+            isTrackingBackground = false;
+        }
+
+        return response;
+    };
+
+    patchedFetch._tokenUsageTrackerPatched = true;
+    window.fetch = patchedFetch;
 }
 
 function patchGenerateQuietPrompt() {
