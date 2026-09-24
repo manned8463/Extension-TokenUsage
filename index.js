@@ -2215,11 +2215,9 @@ function patchFetchForExtensionCalls() {
 
             if (apiUsage) {
                 recordUsage(apiUsage.input, apiUsage.output, null, modelId, apiUsage);
-                console.log(`[Token Usage Tracker] Recorded extension fetch() call (API-reported): ${apiUsage.input} in, ${apiUsage.output} out, model: ${modelId || 'unknown'}`);
                 lastExtensionFetchRecordAt = Date.now();
             } else if (inputTokens > 0 || outputTokens > 0) {
                 recordUsage(inputTokens, outputTokens, null, modelId);
-                console.log(`[Token Usage Tracker] Recorded extension fetch() call: ${inputTokens} in, ${outputTokens} out, model: ${modelId || 'unknown'}`);
                 lastExtensionFetchRecordAt = Date.now();
             }
         } catch (e) {
@@ -2385,7 +2383,6 @@ function patchConnectionManager() {
 
                             if (outputTokens > 0 || inputTokens > 0) {
                                 recordUsage(inputTokens, outputTokens, null, modelId);
-                                console.log(`[Token Usage Tracker] Recorded sendRequest call (fallback estimate): ${inputTokens} in, ${outputTokens} out, model: ${modelId || 'unknown'}`);
                             }
                         } catch (e) {
                             console.error('[Token Usage Tracker] Error in sendRequest fallback counting:', e);
